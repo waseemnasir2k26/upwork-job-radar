@@ -1,0 +1,1 @@
+upwork,freelancing,freelance,job-alerts,job-search,n8n,slack,slack-bot,automation,workflow-automation,api-integration,graphql,python,javascript,notifications,self-hosted,no-code,circuit-breaker,lead-generation,scoring

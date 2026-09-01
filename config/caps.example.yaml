@@ -1,0 +1,43 @@
+# upwork-job-radar - loop safety caps
+#
+# Copy to caps.yaml and tune. These are not documentation of good intentions:
+# scoring/caps.py enforces every value here, and the n8n workflow reads the
+# same numbers from environment variables (see .env.example).
+#
+# Caps live in config. They are never written into a prompt, and no model is
+# ever asked to respect them - the guard refuses the work itself.
+
+# Cap 1 - steps. The most units of work a single execution may do. For this
+# workflow one step is one job scored, so 200 means "at most 200 jobs per run",
+# no matter what a paginated API decides to hand back.
+max_steps_per_run: 200
+
+# Cap 2 - wall clock. Hard stop, in seconds, for a single execution. The guard
+# refuses the next step once this elapses; it does not kill work in flight.
+# Keep it comfortably under your n8n executionTimeout (300s in the shipped
+# workflow) so the run ends on your terms, not the engine's.
+wall_clock_seconds: 120
+
+# Cap 3 - spend. A rolling counter persisted between runs, so a crash-loop
+# cannot reset it to zero and start spending again.
+#
+# The default install spends $0.00: the proposal opener is a template, not a
+# model call. This cap exists because the moment you swap an LLM node into
+# "Format Slack Alert", the radar becomes something that can quietly bill you
+# every ten minutes.
+spend:
+  cap_usd: 5.0
+  window_hours: 24
+
+# Circuit breaker. N consecutive failed runs and the workflow disables itself
+# and says so in Slack.
+circuit_breaker:
+  # Consecutive errors before tripping. A single success resets the count.
+  consecutive_errors: 3
+  # After this long, the breaker allows exactly ONE half-open probe run.
+  # If the probe fails, it re-trips immediately. If it succeeds, the circuit
+  # closes. Set to 0 to require a human reset every time.
+  cooldown_minutes: 60
+  # Set false to count errors and alert without ever auto-disabling.
+  # Only sensible if something else is watching the workflow.
+  auto_disable: true

@@ -1,0 +1,213 @@
+{
+  "_comment": [
+    "Synthetic job payloads in the normalised shape the radar uses internally.",
+    "No real clients, no real job ids, no scraped data - these are written by hand",
+    "to exercise every branch of the rubric. Score them against",
+    "now = 2026-09-01T12:00:00Z to reproduce the numbers in the tests.",
+    "Field mapping from the official Upwork GraphQL response lives in",
+    "workflows/README.md under 'Normalize Jobs'."
+  ],
+  "now": "2026-09-01T12:00:00Z",
+  "jobs": [
+    {
+      "id": "job-001",
+      "title": "n8n workflow to sync orders into our warehouse API",
+      "description": "We need an n8n automation that pulls new Shopify orders and pushes them to our 3PL webhook, with retries and error alerting. Ongoing work likely.",
+      "skills": ["n8n", "API Integration", "Shopify", "Webhook"],
+      "job_type": "fixed",
+      "budget": 3500,
+      "hourly_min": null,
+      "hourly_max": null,
+      "proposals": 3,
+      "posted_at": "2026-09-01T11:10:00Z",
+      "url": "https://www.upwork.com/jobs/~example001",
+      "client": {
+        "country": "US",
+        "hire_rate": 0.82,
+        "total_spend": 46000,
+        "payment_verified": true,
+        "jobs_posted": 37
+      }
+    },
+    {
+      "id": "job-002",
+      "title": "Senior automation engineer for internal tooling",
+      "description": "Long-term hourly engagement building internal automation and API integration work. Stack is Node and Postgres.",
+      "skills": ["Automation", "Node.js", "PostgreSQL"],
+      "job_type": "hourly",
+      "budget": null,
+      "hourly_min": 55,
+      "hourly_max": 85,
+      "proposals": 7,
+      "posted_at": "2026-09-01T06:00:00Z",
+      "url": "https://www.upwork.com/jobs/~example002",
+      "client": {
+        "country": "GB",
+        "hire_rate": 0.64,
+        "total_spend": 128000,
+        "payment_verified": true,
+        "jobs_posted": 91
+      }
+    },
+    {
+      "id": "job-003",
+      "title": "WordPress site fixes and speed work",
+      "description": "Small WordPress maintenance tasks, a few plugin conflicts to resolve.",
+      "skills": ["WordPress", "PHP"],
+      "job_type": "fixed",
+      "budget": 900,
+      "hourly_min": null,
+      "hourly_max": null,
+      "proposals": 22,
+      "posted_at": "2026-08-31T12:00:00Z",
+      "url": "https://www.upwork.com/jobs/~example003",
+      "client": {
+        "country": "CA",
+        "hire_rate": 0.51,
+        "total_spend": 7400,
+        "payment_verified": true,
+        "jobs_posted": 14
+      }
+    },
+    {
+      "id": "job-004",
+      "title": "Build our whole SaaS platform",
+      "description": "Looking for a technical co-founder type. This is equity only for now, revenue share once we raise.",
+      "skills": ["Full Stack", "React"],
+      "job_type": "fixed",
+      "budget": 4000,
+      "hourly_min": null,
+      "hourly_max": null,
+      "proposals": 2,
+      "posted_at": "2026-09-01T11:45:00Z",
+      "url": "https://www.upwork.com/jobs/~example004",
+      "client": {
+        "country": "US",
+        "hire_rate": 0.9,
+        "total_spend": 22000,
+        "payment_verified": true,
+        "jobs_posted": 12
+      }
+    },
+    {
+      "id": "job-005",
+      "title": "Automation specialist needed urgently",
+      "description": "Need an n8n and OpenAI automation built this week. Serious applicants only.",
+      "skills": ["n8n", "OpenAI", "Automation"],
+      "job_type": "fixed",
+      "budget": 2800,
+      "hourly_min": null,
+      "hourly_max": null,
+      "proposals": 4,
+      "posted_at": "2026-09-01T11:30:00Z",
+      "url": "https://www.upwork.com/jobs/~example005",
+      "client": {
+        "country": "US",
+        "hire_rate": 0.18,
+        "total_spend": 3100,
+        "payment_verified": true,
+        "jobs_posted": 28
+      }
+    },
+    {
+      "id": "job-006",
+      "title": "Shopify to CRM webhook integration",
+      "description": "Connect our Shopify store to the CRM with a webhook and an automation layer.",
+      "skills": ["Shopify", "Webhook", "Automation"],
+      "job_type": "fixed",
+      "budget": 2200,
+      "hourly_min": null,
+      "hourly_max": null,
+      "proposals": 5,
+      "posted_at": "2026-09-01T10:40:00Z",
+      "url": "https://www.upwork.com/jobs/~example006",
+      "client": {
+        "country": "DE",
+        "hire_rate": 0.71,
+        "total_spend": 15500,
+        "payment_verified": false,
+        "jobs_posted": 9
+      }
+    },
+    {
+      "id": "job-007",
+      "title": "Small WordPress logo swap",
+      "description": "Quick job, swap a logo and adjust the header on a WordPress site.",
+      "skills": ["WordPress"],
+      "job_type": "fixed",
+      "budget": 120,
+      "hourly_min": null,
+      "hourly_max": null,
+      "proposals": 1,
+      "posted_at": "2026-09-01T11:55:00Z",
+      "url": "https://www.upwork.com/jobs/~example007",
+      "client": {
+        "country": "AU",
+        "hire_rate": 0.75,
+        "total_spend": 5200,
+        "payment_verified": true,
+        "jobs_posted": 6
+      }
+    },
+    {
+      "id": "job-008",
+      "title": "First-time poster needs an API integration built",
+      "description": "New here. We need an API integration between two internal systems, with an automation to keep them in sync.",
+      "skills": ["API Integration", "Automation"],
+      "job_type": "hourly",
+      "budget": null,
+      "hourly_min": 45,
+      "hourly_max": 70,
+      "proposals": 6,
+      "posted_at": "2026-09-01T09:00:00Z",
+      "url": "https://www.upwork.com/jobs/~example008",
+      "client": {
+        "country": "NL",
+        "hire_rate": null,
+        "total_spend": null,
+        "payment_verified": true,
+        "jobs_posted": 0
+      }
+    },
+    {
+      "id": "job-009",
+      "title": "Data entry and virtual assistant support",
+      "description": "Simple repetitive data entry work, long hours, low pressure.",
+      "skills": ["Data Entry"],
+      "job_type": "hourly",
+      "budget": null,
+      "hourly_min": 6,
+      "hourly_max": 9,
+      "proposals": 48,
+      "posted_at": "2026-08-30T12:00:00Z",
+      "url": "https://www.upwork.com/jobs/~example009",
+      "client": {
+        "country": "IN",
+        "hire_rate": 0.44,
+        "total_spend": 2400,
+        "payment_verified": true,
+        "jobs_posted": 31
+      }
+    },
+    {
+      "id": "job-010",
+      "title": "Ongoing n8n and workflow automation retainer",
+      "description": "We run a lot of internal automation and want someone on retainer for n8n workflow builds and API integration fixes.",
+      "skills": ["n8n", "Automation", "API Integration"],
+      "job_type": "fixed",
+      "budget": 6000,
+      "hourly_min": null,
+      "hourly_max": null,
+      "proposals": 14,
+      "posted_at": "2026-08-30T20:00:00Z",
+      "url": "https://www.upwork.com/jobs/~example010",
+      "client": {
+        "country": "SG",
+        "hire_rate": 0.58,
+        "total_spend": 33000,
+        "payment_verified": true,
+        "jobs_posted": 24
+      }
+    }
+  ]
+}

@@ -1,0 +1,49 @@
+# secrets - never commit a filled-in env file
+.env
+.env.*
+!.env.example
+
+# local, tuned copies of the example configs
+config/rubric.yaml
+config/caps.yaml
+config/*.local.yaml
+
+# runtime state (spend counters, breaker state, seen job ids)
+state/
+*.state.json
+
+# real job data pulled from the API - may contain client details
+data/
+jobs.local.json
+*.jobs.json
+!tests/fixtures/*.json
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# node
+node_modules/
+npm-debug.log*
+package-lock.json
+
+# editors / os
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini

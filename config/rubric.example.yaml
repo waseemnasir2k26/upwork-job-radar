@@ -1,0 +1,101 @@
+# upwork-job-radar - scoring rubric
+#
+# Copy to rubric.yaml and tune. Every value here is also the built-in default,
+# so the radar runs correctly with no config file at all.
+#
+# Two things to understand before you tune:
+#
+#   weights     decide how many of the 100 points a criterion can contribute.
+#               Set a weight to 0 to switch that criterion off completely -
+#               including its hard gate.
+#   hard_gate   turns a criterion into a veto. A hard gate that fails sets the
+#               score to 0 and names itself in the alert. raw_score still shows
+#               what the job would have scored, which is what you want when you
+#               are deciding whether a gate is too tight.
+
+# Alert only at or above this score. 70 is deliberately strict: the point of
+# the radar is a quiet channel you actually read.
+alert_threshold: 70
+
+# What to do about a client with no history at all (no hire rate, no spend).
+#   neutral    half credit - a new client is unknown, not bad (default)
+#   penalize   zero credit, but still eligible
+#   disqualify never alert on a first-time poster
+unknown_client_policy: neutral
+
+# Must add up to 100 if you want scores to read as percentages.
+weights:
+  client_country: 10
+  hire_rate: 15
+  client_spend: 12
+  payment_verified: 8
+  budget: 20
+  proposals: 15
+  keywords: 12
+  freshness: 8
+
+client_country:
+  # Empty allowlist means "allow everywhere". Blocklist always wins.
+  # Quote the codes. Unquoted, YAML reads NO (Norway) as the boolean false -
+  # tests/test_cli.py asserts this file round-trips to the built-in defaults
+  # precisely so that class of bug cannot ship.
+  allowlist:
+    [
+      "US", "CA", "GB", "AU", "NZ", "IE", "DE", "NL", "SE", "NO",
+      "DK", "FI", "CH", "AT", "BE", "FR", "SG", "AE",
+    ]
+  blocklist: []
+  hard_gate: true
+
+hire_rate:
+  target: 0.60 # full credit at or above this
+  hard_fail_below: 0.40 # veto below this
+  hard_gate: true
+
+client_spend:
+  target_usd: 10000 # full credit at or above this lifetime spend
+  hard_fail_below_usd: 0
+  hard_gate: false # off by default: low spend is a signal, not a crime
+
+payment_verified:
+  required: true # unverified payment method = veto
+
+budget:
+  fixed_floor_usd: 500 # veto fixed-price jobs under this
+  fixed_target_usd: 3000 # full credit at or above this
+  hourly_floor_usd: 35 # veto hourly jobs whose max rate is under this
+  hourly_target_usd: 75
+  hard_gate: true
+  # Plenty of good jobs hide the budget. neutral | penalize | disqualify
+  missing_budget_policy: neutral
+
+proposals:
+  ideal_max: 5 # full credit at or below this many existing proposals
+  zero_at: 50 # no credit at or above this many
+
+keywords:
+  # If must_have_any is non-empty, a job must match at least one of these.
+  must_have_any: []
+  # Any match here is an instant veto. Case-insensitive substring match against
+  # title + description + skills.
+  must_not_have:
+    - unpaid
+    - revenue share only
+    - equity only
+    - no budget
+  # Nice-to-haves. Three or more matches earn full credit for this criterion.
+  bonus:
+    - n8n
+    - automation
+    - workflow
+    - api integration
+    - wordpress
+    - shopify
+    - openai
+    - anthropic
+    - webhook
+  hard_gate: true
+
+freshness:
+  fresh_hours: 2 # full credit inside this window
+  stale_hours: 48 # no credit at or beyond this age

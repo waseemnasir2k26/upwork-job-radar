@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "upwork-job-radar"
+version = "1.0.0"
+description = "Read-only Upwork job radar: score jobs against your own rubric and alert a human in Slack. Never applies, never bids."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Waseem Nasir (SkynetLabs)" }]
+keywords = ["upwork", "freelancing", "n8n", "slack", "automation", "job-alerts"]
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Topic :: Office/Business",
+  "Topic :: Utilities",
+]
+
+# No runtime dependencies. The scorer, the caps and the CLI are pure stdlib.
+dependencies = []
+
+[project.optional-dependencies]
+# Only needed to read the YAML files in config/. Without it, pass the same
+# structure as JSON or run on the built-in defaults.
+yaml = ["pyyaml>=6.0"]
+
+[project.urls]
+Homepage = "https://github.com/skynetlabs/upwork-job-radar"
+
+[project.scripts]
+upwork-job-radar = "scoring.cli:main"
+
+[tool.setuptools]
+packages = ["scoring"]

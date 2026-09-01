@@ -1,0 +1,568 @@
+{
+  "name": "Upwork Job Radar",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 10
+            }
+          ]
+        }
+      },
+      "id": "schedule-poll",
+      "name": "Every 10 Minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -460,
+        0
+      ],
+      "notes": "Poll interval. 5 / 10 / 20 minutes are all sane; anything under 5 mostly burns API quota."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Load Config - the single place the run reads its rubric and its caps.\n// Everything is overridable by env var so caps live in config, never in a prompt.\nconst num = (v, d) => (v === undefined || v === null || v === '' ? d : Number(v));\n\nconst rubricOverride = $env.RADAR_RUBRIC_JSON ? JSON.parse($env.RADAR_RUBRIC_JSON) : {};\nconst capsOverride = $env.RADAR_CAPS_JSON ? JSON.parse($env.RADAR_CAPS_JSON) : {};\n\nconst caps = Object.assign({\n  max_steps_per_run: num($env.RADAR_MAX_STEPS_PER_RUN, 200),\n  wall_clock_seconds: num($env.RADAR_WALL_CLOCK_SECONDS, 120),\n  spend: {\n    cap_usd: num($env.RADAR_SPEND_CAP_USD, 5),\n    window_hours: num($env.RADAR_SPEND_WINDOW_HOURS, 24),\n  },\n  circuit_breaker: {\n    consecutive_errors: num($env.RADAR_BREAKER_CONSECUTIVE_ERRORS, 3),\n    cooldown_minutes: num($env.RADAR_BREAKER_COOLDOWN_MINUTES, 60),\n    auto_disable: true,\n  },\n}, capsOverride);\n\nconst rubric = Object.assign({\n  alert_threshold: num($env.RADAR_ALERT_THRESHOLD, 70),\n}, rubricOverride);\n\nreturn [{\n  json: {\n    rubric,\n    caps,\n    search_query: $env.RADAR_SEARCH_QUERY || 'n8n OR automation OR \"api integration\"',\n    page_size: num($env.RADAR_PAGE_SIZE, 50),\n    slack_channel: $env.SLACK_CHANNEL_ID || '',\n  },\n}];\n"
+      },
+      "id": "load-config",
+      "name": "Load Config",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -240,
+        0
+      ],
+      "notes": "Reads the rubric and all three caps from env vars. Caps live in config, never in a prompt.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "/**\n * JS twin of scoring/caps.py - the three loop caps plus the circuit breaker.\n *\n * Embedded into the \"Caps Preflight\" and \"Persist State\" Code nodes of\n * workflows/upwork-job-radar.json by scripts/build_workflow.py. Edit here,\n * then rebuild - never edit the copy inside the workflow JSON.\n *\n * In n8n the state object lives in $getWorkflowStaticData('global').caps, so\n * it survives between executions, which is the whole point of a spend counter.\n *\n * tests/test_parity.py drives the same scripted sequence through both this\n * file and caps.py and fails if the resulting state differs.\n */\n\nconst DEFAULT_CAPS = {\n  max_steps_per_run: 200,\n  wall_clock_seconds: 120,\n  spend: { cap_usd: 5.0, window_hours: 24 },\n  circuit_breaker: {\n    consecutive_errors: 3,\n    cooldown_minutes: 60,\n    auto_disable: true,\n  },\n};\n\nclass CapExceeded extends Error {\n  constructor(cap, message) {\n    super(message);\n    this.name = \"CapExceeded\";\n    this.cap = cap;\n  }\n}\n\nclass CircuitOpen extends CapExceeded {\n  constructor(message) {\n    super(\"circuit_breaker\", message);\n    this.name = \"CircuitOpen\";\n  }\n}\n\nfunction mergeCaps(base, override) {\n  const out = {};\n  Object.keys(base).forEach((k) => {\n    const v = base[k];\n    out[k] =\n      v && typeof v === \"object\" && !Array.isArray(v)\n        ? Object.assign({}, v)\n        : v;\n  });\n  if (!override) return out;\n  Object.keys(override).forEach((k) => {\n    const v = override[k];\n    if (\n      v &&\n      typeof v === \"object\" &&\n      !Array.isArray(v) &&\n      out[k] &&\n      typeof out[k] === \"object\" &&\n      !Array.isArray(out[k])\n    ) {\n      out[k] = Object.assign({}, out[k], v);\n    } else {\n      out[k] = v;\n    }\n  });\n  return out;\n}\n\nfunction parseDate(value) {\n  if (value === null || value === undefined) return null;\n  if (value instanceof Date) return isNaN(value.getTime()) ? null : value;\n  let text = String(value);\n  if (!/(Z|[+-]\\d{2}:?\\d{2})$/.test(text)) text += \"Z\";\n  const ms = Date.parse(text);\n  return isNaN(ms) ? null : new Date(ms);\n}\n\nfunction isoOf(date) {\n  return date === null || date === undefined ? null : date.toISOString();\n}\n\nclass CapsGuard {\n  constructor(caps, state, nowFn) {\n    this.caps = mergeCaps(DEFAULT_CAPS, caps);\n    this.nowFn = nowFn || (() => new Date());\n    const s = state || {};\n    this.spendUsd = Number(s.spend_usd || 0);\n    this.windowStart = parseDate(s.window_start) || this.nowFn();\n    this.consecutiveErrors = Number(s.consecutive_errors || 0);\n    this.disabled = Boolean(s.disabled);\n    this.disabledReason =\n      s.disabled_reason === undefined ? null : s.disabled_reason;\n    this.disabledAt = parseDate(s.disabled_at);\n    this.lastError = s.last_error === undefined ? null : s.last_error;\n    this.totalRuns = Number(s.total_runs || 0);\n    this.totalSteps = Number(s.total_steps || 0);\n    this.halfOpen = Boolean(s.half_open);\n    this.steps = 0;\n    this.runStarted = null;\n  }\n\n  toDict() {\n    return {\n      spend_usd: Math.round(this.spendUsd * 1e6) / 1e6,\n      window_start: isoOf(this.windowStart),\n      consecutive_errors: this.consecutiveErrors,\n      disabled: this.disabled,\n      disabled_reason: this.disabledReason,\n      disabled_at: isoOf(this.disabledAt),\n      last_error: this.lastError,\n      total_runs: this.totalRuns,\n      total_steps: this.totalSteps,\n      half_open: this.halfOpen,\n    };\n  }\n\n  rollSpendWindow() {\n    const windowHours = Number(\n      this.caps.spend.window_hours === undefined\n        ? 24\n        : this.caps.spend.window_hours,\n    );\n    if (\n      this.nowFn().getTime() - this.windowStart.getTime() >=\n      windowHours * 3600000\n    ) {\n      this.spendUsd = 0;\n      this.windowStart = this.nowFn();\n    }\n  }\n\n  cooldownElapsed() {\n    const minutes = Number(this.caps.circuit_breaker.cooldown_minutes || 0);\n    if (!this.disabledAt || minutes <= 0) return false;\n    return (\n      this.nowFn().getTime() - this.disabledAt.getTime() >= minutes * 60000\n    );\n  }\n\n  trip(reason) {\n    this.disabled = true;\n    this.disabledReason = reason;\n    this.disabledAt = this.nowFn();\n    this.halfOpen = false;\n  }\n\n  startRun() {\n    if (this.disabled) {\n      if (this.cooldownElapsed()) {\n        this.disabled = false;\n        this.halfOpen = true;\n      } else {\n        throw new CircuitOpen(\n          \"circuit breaker open: \" + String(this.disabledReason),\n        );\n      }\n    }\n    this.rollSpendWindow();\n    this.steps = 0;\n    this.runStarted = this.nowFn();\n    this.totalRuns += 1;\n  }\n\n  check(projectedCostUsd) {\n    const projected = Number(projectedCostUsd || 0);\n    if (this.disabled) {\n      throw new CircuitOpen(\n        \"circuit breaker open: \" + String(this.disabledReason),\n      );\n    }\n    const maxSteps = Number(this.caps.max_steps_per_run || 0);\n    if (maxSteps && this.steps >= maxSteps) {\n      throw new CapExceeded(\n        \"max_steps_per_run\",\n        \"step cap reached: \" + this.steps + \"/\" + maxSteps,\n      );\n    }\n    const wall = Number(this.caps.wall_clock_seconds || 0);\n    if (wall && this.runStarted) {\n      const elapsed =\n        (this.nowFn().getTime() - this.runStarted.getTime()) / 1000;\n      if (elapsed >= wall) {\n        throw new CapExceeded(\n          \"wall_clock_seconds\",\n          \"wall clock cap reached: \" +\n            elapsed.toFixed(1) +\n            \"s/\" +\n            wall.toFixed(0) +\n            \"s\",\n        );\n      }\n    }\n    const capUsd = Number(this.caps.spend.cap_usd || 0);\n    if (capUsd) {\n      this.rollSpendWindow();\n      if (this.spendUsd + projected > capUsd) {\n        throw new CapExceeded(\n          \"spend\",\n          \"spend cap reached: $\" +\n            (this.spendUsd + projected).toFixed(4) +\n            \"/$\" +\n            capUsd.toFixed(2) +\n            \" in the last \" +\n            this.caps.spend.window_hours +\n            \"h\",\n        );\n      }\n    }\n  }\n\n  recordStep(costUsd) {\n    this.steps += 1;\n    this.totalSteps += 1;\n    const cost = Number(costUsd || 0);\n    if (cost) {\n      this.rollSpendWindow();\n      this.spendUsd += cost;\n    }\n  }\n\n  recordError(message) {\n    this.consecutiveErrors += 1;\n    this.lastError = message || null;\n    const breaker = this.caps.circuit_breaker;\n    if (breaker.auto_disable === false) return false;\n    const limit = Number(breaker.consecutive_errors || 3);\n    if (this.halfOpen) {\n      this.trip(\"half-open probe failed: \" + (message || \"unknown error\"));\n      return true;\n    }\n    if (this.consecutiveErrors >= limit) {\n      this.trip(\n        this.consecutiveErrors +\n          \" consecutive errors (limit \" +\n          limit +\n          \"): \" +\n          (message || \"unknown error\"),\n      );\n      return true;\n    }\n    return false;\n  }\n\n  recordSuccess() {\n    this.consecutiveErrors = 0;\n    this.lastError = null;\n    this.halfOpen = false;\n  }\n\n  reset() {\n    this.disabled = false;\n    this.disabledReason = null;\n    this.disabledAt = null;\n    this.consecutiveErrors = 0;\n    this.halfOpen = false;\n  }\n\n  remaining() {\n    this.rollSpendWindow();\n    const elapsed = this.runStarted\n      ? (this.nowFn().getTime() - this.runStarted.getTime()) / 1000\n      : 0;\n    return {\n      steps_used: this.steps,\n      steps_cap: Number(this.caps.max_steps_per_run || 0),\n      seconds_used: Math.round(elapsed * 100) / 100,\n      seconds_cap: Number(this.caps.wall_clock_seconds || 0),\n      spend_used_usd: Math.round(this.spendUsd * 10000) / 10000,\n      spend_cap_usd: Number(this.caps.spend.cap_usd || 0),\n      spend_window_hours: this.caps.spend.window_hours,\n      consecutive_errors: this.consecutiveErrors,\n      disabled: this.disabled,\n      disabled_reason: this.disabledReason,\n      half_open: this.halfOpen,\n    };\n  }\n}\n\nif (typeof module !== \"undefined\" && module.exports) {\n  module.exports = { DEFAULT_CAPS, CapsGuard, CapExceeded, CircuitOpen };\n}\n\n// --- n8n runner ---\n// --- n8n runner: caps preflight -------------------------------------------\n// Reads persisted state from workflow static data, opens the run, and either\n// lets it through or short-circuits to the circuit-breaker alert branch.\nconst staticData = $getWorkflowStaticData('global');\nconst cfg = $input.first().json;\nstaticData.caps = staticData.caps || {};\n\nconst guard = new CapsGuard(cfg.caps, staticData.caps);\nlet blocked = false;\nlet blockedCap = null;\nlet blockedReason = null;\n\ntry {\n  guard.startRun();\n} catch (err) {\n  blocked = true;\n  blockedCap = err.cap || 'unknown';\n  blockedReason = err.message;\n}\n\nstaticData.caps = guard.toDict();\nstaticData.run_started_at = new Date().toISOString();\n\nreturn [{\n  json: Object.assign({}, cfg, {\n    blocked,\n    blocked_cap: blockedCap,\n    blocked_reason: blockedReason,\n    caps_state: guard.toDict(),\n    caps_remaining: guard.remaining(),\n  }),\n}];\n"
+      },
+      "id": "caps-preflight",
+      "name": "Caps Preflight",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -20,
+        0
+      ],
+      "notes": "Circuit breaker + spend window + run clock. Sets blocked=true instead of throwing, so the false branch can alert.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "caps-ok",
+              "leftValue": "={{ $json.blocked }}",
+              "rightValue": false,
+              "operator": {
+                "type": "boolean",
+                "operation": "false",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "caps-ok",
+      "name": "Caps OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        200,
+        0
+      ],
+      "notes": "True = run. False = the breaker or a cap stopped this run."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.upwork.com/graphql",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "oAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ query: \"query marketplaceJobPostings($q: String!, $first: Int!) {\\n  marketplaceJobPostingsSearch(\\n    marketPlaceJobFilter: { searchExpression_eq: $q }\\n    searchType: USER_JOBS_SEARCH\\n    sortAttributes: [{ field: RECENCY }]\\n    pagination: { first: $first }\\n  ) {\\n    edges {\\n      node {\\n        id ciphertext title description publishedDateTime createdDateTime\\n        totalApplicants\\n        skills { name }\\n        amount { rawValue }\\n        hourlyBudgetMin { rawValue }\\n        hourlyBudgetMax { rawValue }\\n        job { contractTerms { contractType } }\\n        client {\\n          totalHires totalPostedJobs verificationStatus\\n          location { country }\\n          totalSpent { rawValue }\\n        }\\n      }\\n    }\\n  }\\n}\", variables: { q: $json.search_query, first: $json.page_size } }) }}",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "id": "upwork-search",
+      "name": "Upwork GraphQL Search",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        420,
+        -110
+      ],
+      "notes": "Official Upwork GraphQL API over OAuth2. READ ONLY - this is a search query and nothing else. Never point this at a browser-automation endpoint.",
+      "credentials": {
+        "oAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "Upwork OAuth2 API"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Normalize Jobs - map the official Upwork GraphQL response into the flat\n// shape the scorer expects. Field names follow the public marketplace job\n// posting search schema; adjust here (not in the scorer) if Upwork renames a\n// field. Nothing is written back to Upwork.\nconst cfg = $('Caps Preflight').first().json;\nconst response = $input.first().json;\nconst edges =\n  (((response.data || {}).marketplaceJobPostingsSearch || {}).edges) || [];\n\nconst jobs = edges.map((edge) => {\n  const n = edge.node || {};\n  const client = n.client || {};\n  const amount = (n.amount || {}).rawValue;\n  const hourlyMin = ((n.hourlyBudgetMin || {}).rawValue);\n  const hourlyMax = ((n.hourlyBudgetMax || {}).rawValue);\n  const ciphertext = n.ciphertext || n.id || '';\n  return {\n    id: n.id || ciphertext,\n    title: n.title || '',\n    description: n.description || '',\n    skills: (n.skills || []).map((s) => (s && s.name ? s.name : String(s))),\n    job_type: String(n.job && n.job.contractTerms\n      && n.job.contractTerms.contractType === 'HOURLY' ? 'hourly' : 'fixed'),\n    budget: amount === undefined || amount === null ? null : Number(amount),\n    hourly_min: hourlyMin === undefined || hourlyMin === null ? null : Number(hourlyMin),\n    hourly_max: hourlyMax === undefined || hourlyMax === null ? null : Number(hourlyMax),\n    proposals: n.totalApplicants === undefined ? null : Number(n.totalApplicants),\n    posted_at: n.publishedDateTime || n.createdDateTime || null,\n    url: ciphertext ? 'https://www.upwork.com/jobs/' + ciphertext : null,\n    client: {\n      country: (client.location || {}).country || null,\n      hire_rate: client.totalHires && client.totalPostedJobs\n        ? client.totalHires / client.totalPostedJobs : null,\n      total_spend: ((client.totalSpent || {}).rawValue) === undefined\n        ? null : Number((client.totalSpent || {}).rawValue),\n      payment_verified: client.verificationStatus === undefined\n        ? null : client.verificationStatus === 'VERIFIED',\n      jobs_posted: client.totalPostedJobs === undefined\n        ? null : Number(client.totalPostedJobs),\n    },\n  };\n});\n\nreturn jobs.map((job) => ({ json: { job, rubric: cfg.rubric, caps: cfg.caps } }));\n"
+      },
+      "id": "normalize-jobs",
+      "name": "Normalize Jobs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        -110
+      ],
+      "notes": "Maps the GraphQL response onto the flat job shape the scorer expects. Change field mapping here, never in the scorer.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "/**\n * JS twin of scoring/score.py.\n *\n * This exact file is embedded into the \"Score Jobs\" Code node of\n * workflows/upwork-job-radar.json by scripts/build_workflow.py. Do not edit\n * the copy inside the workflow JSON - edit this file and rebuild.\n *\n * tests/test_parity.py runs this under Node against the same fixtures as the\n * Python scorer and fails if a single number or reason string differs, so the\n * logic you review in Python is provably the logic n8n runs.\n *\n * Read-only: this file scores jobs. It never calls Upwork.\n */\n\nconst DEFAULT_RUBRIC = {\n  alert_threshold: 70,\n  unknown_client_policy: \"neutral\",\n  weights: {\n    client_country: 10,\n    hire_rate: 15,\n    client_spend: 12,\n    payment_verified: 8,\n    budget: 20,\n    proposals: 15,\n    keywords: 12,\n    freshness: 8,\n  },\n  client_country: {\n    allowlist: [\n      \"US\",\n      \"CA\",\n      \"GB\",\n      \"AU\",\n      \"NZ\",\n      \"IE\",\n      \"DE\",\n      \"NL\",\n      \"SE\",\n      \"NO\",\n      \"DK\",\n      \"FI\",\n      \"CH\",\n      \"AT\",\n      \"BE\",\n      \"FR\",\n      \"SG\",\n      \"AE\",\n    ],\n    blocklist: [],\n    hard_gate: true,\n  },\n  hire_rate: { target: 0.6, hard_fail_below: 0.4, hard_gate: true },\n  client_spend: { target_usd: 10000, hard_fail_below_usd: 0, hard_gate: false },\n  payment_verified: { required: true },\n  budget: {\n    fixed_floor_usd: 500,\n    fixed_target_usd: 3000,\n    hourly_floor_usd: 35,\n    hourly_target_usd: 75,\n    hard_gate: true,\n    missing_budget_policy: \"neutral\",\n  },\n  proposals: { ideal_max: 5, zero_at: 50 },\n  keywords: {\n    must_have_any: [],\n    must_not_have: [\"unpaid\", \"revenue share only\", \"equity only\", \"no budget\"],\n    bonus: [\n      \"n8n\",\n      \"automation\",\n      \"workflow\",\n      \"api integration\",\n      \"wordpress\",\n      \"shopify\",\n      \"openai\",\n      \"anthropic\",\n      \"webhook\",\n    ],\n    hard_gate: true,\n  },\n  freshness: { fresh_hours: 2, stale_hours: 48 },\n};\n\nfunction roundHalfUp(value, digits) {\n  const d = digits || 0;\n  const factor = Math.pow(10, d);\n  const scaled = Math.floor(Math.abs(value) * factor + 0.5) / factor;\n  return value < 0 ? -scaled : scaled;\n}\n\nfunction mergeRubric(base, override) {\n  const out = {};\n  Object.keys(base).forEach((k) => {\n    const v = base[k];\n    out[k] =\n      v && typeof v === \"object\" && !Array.isArray(v)\n        ? Object.assign({}, v)\n        : v;\n  });\n  if (!override) return out;\n  Object.keys(override).forEach((k) => {\n    const v = override[k];\n    if (\n      v &&\n      typeof v === \"object\" &&\n      !Array.isArray(v) &&\n      out[k] &&\n      typeof out[k] === \"object\" &&\n      !Array.isArray(out[k])\n    ) {\n      out[k] = Object.assign({}, out[k], v);\n    } else {\n      out[k] = v;\n    }\n  });\n  return out;\n}\n\nfunction clamp(value, low, high) {\n  const lo = low === undefined ? 0 : low;\n  const hi = high === undefined ? 1 : high;\n  return Math.max(lo, Math.min(hi, value));\n}\n\nfunction ramp(value, zeroAt, fullAt) {\n  if (fullAt === zeroAt) return value >= fullAt ? 1 : 0;\n  return clamp((value - zeroAt) / (fullAt - zeroAt));\n}\n\nfunction parseTs(value) {\n  if (value === null || value === undefined) return null;\n  if (value instanceof Date) return isNaN(value.getTime()) ? null : value;\n  let text = String(value).trim();\n  // Match Python's fromisoformat + \"naive means UTC\" behaviour.\n  if (!/(Z|[+-]\\d{2}:?\\d{2})$/.test(text)) text += \"Z\";\n  const ms = Date.parse(text);\n  return isNaN(ms) ? null : new Date(ms);\n}\n\nfunction haystack(job) {\n  const skills = (job.skills || []).map(String).join(\" \");\n  return [String(job.title || \"\"), String(job.description || \"\"), skills]\n    .join(\" \")\n    .toLowerCase();\n}\n\nfunction pct(value) {\n  if (value === null || value === undefined) return null;\n  const number = Number(value);\n  if (isNaN(number)) return null;\n  return number > 1 ? number / 100 : number;\n}\n\nfunction money(value) {\n  const n = Math.trunc(roundHalfUp(value, 0));\n  return String(n).replace(/\\B(?=(\\d{3})+(?!\\d))/g, \",\");\n}\n\nfunction pctStr(value) {\n  return money(value * 100) + \"%\";\n}\n\nfunction hours(value) {\n  return roundHalfUp(value, 1).toFixed(1);\n}\n\nfunction crit(key, earned, maximum, reason) {\n  return {\n    key: key,\n    earned: roundHalfUp(earned, 2),\n    maximum: roundHalfUp(maximum, 2),\n    reason: reason,\n  };\n}\n\n// -- criteria ---------------------------------------------------------------\n\nfunction cCountry(job, rub, weight, disq) {\n  const cfg = rub.client_country;\n  const raw = (job.client || {}).country;\n  const code = raw ? String(raw).toUpperCase() : null;\n  const allow = (cfg.allowlist || []).map((c) => String(c).toUpperCase());\n  const block = (cfg.blocklist || []).map((c) => String(c).toUpperCase());\n  if (code === null) {\n    return crit(\n      \"client_country\",\n      weight * 0.5,\n      weight,\n      \"client country unknown - half credit\",\n    );\n  }\n  if (block.indexOf(code) !== -1) {\n    if (cfg.hard_gate)\n      disq.push(\"client country \" + code + \" is on the blocklist\");\n    return crit(\"client_country\", 0, weight, code + \" is blocklisted\");\n  }\n  if (allow.length && allow.indexOf(code) === -1) {\n    if (cfg.hard_gate)\n      disq.push(\"client country \" + code + \" is not on the allowlist\");\n    return crit(\"client_country\", 0, weight, code + \" is not on the allowlist\");\n  }\n  return crit(\"client_country\", weight, weight, code + \" allowed\");\n}\n\nfunction cHireRate(job, rub, weight, disq) {\n  const cfg = rub.hire_rate;\n  const rate = pct((job.client || {}).hire_rate);\n  if (rate === null) {\n    const policy = rub.unknown_client_policy || \"neutral\";\n    if (policy === \"disqualify\") {\n      disq.push(\"client has no hire-rate history\");\n      return crit(\"hire_rate\", 0, weight, \"no hire history\");\n    }\n    const share = policy === \"penalize\" ? 0 : 0.5;\n    return crit(\n      \"hire_rate\",\n      weight * share,\n      weight,\n      \"no hire history - policy '\" + policy + \"'\",\n    );\n  }\n  const floor = Number(cfg.hard_fail_below || 0);\n  if (rate < floor) {\n    if (cfg.hard_gate) {\n      disq.push(\n        \"hire rate \" +\n          pctStr(rate) +\n          \" is below the \" +\n          pctStr(floor) +\n          \" floor\",\n      );\n    }\n    return crit(\n      \"hire_rate\",\n      0,\n      weight,\n      pctStr(rate) + \" below \" + pctStr(floor) + \" floor\",\n    );\n  }\n  const share = ramp(\n    rate,\n    floor,\n    Number(cfg.target === undefined ? 1 : cfg.target),\n  );\n  return crit(\"hire_rate\", weight * share, weight, pctStr(rate) + \" hire rate\");\n}\n\nfunction cSpend(job, rub, weight, disq) {\n  const cfg = rub.client_spend;\n  const rawSpend = (job.client || {}).total_spend;\n  if (rawSpend === null || rawSpend === undefined) {\n    const policy = rub.unknown_client_policy || \"neutral\";\n    if (policy === \"disqualify\") {\n      disq.push(\"client spend unknown\");\n      return crit(\"client_spend\", 0, weight, \"spend unknown\");\n    }\n    const share = policy === \"penalize\" ? 0 : 0.5;\n    return crit(\n      \"client_spend\",\n      weight * share,\n      weight,\n      \"spend unknown - policy '\" + policy + \"'\",\n    );\n  }\n  const spend = Number(rawSpend);\n  const floor = Number(cfg.hard_fail_below_usd || 0);\n  if (spend < floor) {\n    if (cfg.hard_gate) {\n      disq.push(\"client spend $\" + money(spend) + \" below $\" + money(floor));\n    }\n    return crit(\"client_spend\", 0, weight, \"$\" + money(spend) + \" below floor\");\n  }\n  const share = ramp(spend, floor, Number(cfg.target_usd || 1));\n  return crit(\n    \"client_spend\",\n    weight * share,\n    weight,\n    \"$\" + money(spend) + \" lifetime spend\",\n  );\n}\n\nfunction cPayment(job, rub, weight, disq) {\n  const cfg = rub.payment_verified;\n  const verified = (job.client || {}).payment_verified;\n  if (verified === null || verified === undefined) {\n    return crit(\n      \"payment_verified\",\n      weight * 0.5,\n      weight,\n      \"verification status unknown\",\n    );\n  }\n  if (!verified) {\n    if (cfg.required) disq.push(\"client payment method is not verified\");\n    return crit(\"payment_verified\", 0, weight, \"not verified\");\n  }\n  return crit(\"payment_verified\", weight, weight, \"verified\");\n}\n\nfunction cBudget(job, rub, weight, disq) {\n  const cfg = rub.budget;\n  const jobType = String(job.job_type || \"fixed\").toLowerCase();\n  let rate;\n  let floor;\n  let target;\n  let label;\n  if (jobType === \"hourly\") {\n    rate = job.hourly_max || job.hourly_min;\n    floor = Number(cfg.hourly_floor_usd || 0);\n    target = Number(cfg.hourly_target_usd || 1);\n    label = \"/hr\";\n  } else {\n    rate = job.budget;\n    floor = Number(cfg.fixed_floor_usd || 0);\n    target = Number(cfg.fixed_target_usd || 1);\n    label = \" fixed\";\n  }\n  if (rate === null || rate === undefined) {\n    const policy = cfg.missing_budget_policy || \"neutral\";\n    if (policy === \"disqualify\") {\n      disq.push(\"job has no stated budget\");\n      return crit(\"budget\", 0, weight, \"no budget stated\");\n    }\n    const share = policy === \"penalize\" ? 0 : 0.5;\n    return crit(\n      \"budget\",\n      weight * share,\n      weight,\n      \"no budget stated - policy '\" + policy + \"'\",\n    );\n  }\n  rate = Number(rate);\n  if (rate < floor) {\n    if (cfg.hard_gate) {\n      disq.push(\n        \"$\" + money(rate) + label + \" is below the $\" + money(floor) + \" floor\",\n      );\n    }\n    return crit(\n      \"budget\",\n      0,\n      weight,\n      \"$\" + money(rate) + label + \" below floor\",\n    );\n  }\n  const share = ramp(rate, floor, target);\n  return crit(\"budget\", weight * share, weight, \"$\" + money(rate) + label);\n}\n\nfunction cProposals(job, rub, weight) {\n  const cfg = rub.proposals;\n  const raw = job.proposals;\n  if (raw === null || raw === undefined) {\n    return crit(\"proposals\", weight * 0.5, weight, \"proposal count unknown\");\n  }\n  const count = Number(raw);\n  const ideal = Number(cfg.ideal_max === undefined ? 5 : cfg.ideal_max);\n  const zeroAt = Number(cfg.zero_at === undefined ? 50 : cfg.zero_at);\n  let share;\n  if (count <= ideal) share = 1;\n  else if (zeroAt <= ideal) share = 0;\n  else share = clamp((zeroAt - count) / (zeroAt - ideal));\n  return crit(\n    \"proposals\",\n    weight * share,\n    weight,\n    String(Math.trunc(count)) + \" proposals so far\",\n  );\n}\n\nfunction cKeywords(job, rub, weight, disq) {\n  const cfg = rub.keywords;\n  const text = haystack(job);\n  const banned = (cfg.must_not_have || []).filter(\n    (k) => text.indexOf(String(k).toLowerCase()) !== -1,\n  );\n  if (banned.length) {\n    if (cfg.hard_gate) disq.push(\"banned keyword: \" + String(banned[0]));\n    return crit(\n      \"keywords\",\n      0,\n      weight,\n      \"banned keyword '\" + String(banned[0]) + \"'\",\n    );\n  }\n  const bonusHits = (cfg.bonus || []).filter(\n    (k) => text.indexOf(String(k).toLowerCase()) !== -1,\n  );\n  const must = cfg.must_have_any || [];\n  if (must.length) {\n    const hits = must.filter(\n      (k) => text.indexOf(String(k).toLowerCase()) !== -1,\n    );\n    if (!hits.length) {\n      if (cfg.hard_gate) disq.push(\"no must-have keyword present\");\n      return crit(\"keywords\", 0, weight, \"no must-have keyword\");\n    }\n    const base = weight * 0.7;\n    const extra = weight * 0.3 * clamp(bonusHits.length / 3);\n    return crit(\n      \"keywords\",\n      base + extra,\n      weight,\n      \"must-have '\" +\n        String(hits[0]) +\n        \"' + \" +\n        bonusHits.length +\n        \" bonus term(s)\",\n    );\n  }\n  if (!bonusHits.length)\n    return crit(\"keywords\", 0, weight, \"no matching keywords\");\n  const share = clamp(bonusHits.length / 3);\n  return crit(\n    \"keywords\",\n    weight * share,\n    weight,\n    bonusHits.length +\n      \" bonus term(s): \" +\n      bonusHits.slice(0, 3).map(String).join(\", \"),\n  );\n}\n\nfunction cFreshness(job, rub, weight, disq, now) {\n  const cfg = rub.freshness;\n  const posted = parseTs(job.posted_at);\n  if (posted === null)\n    return crit(\"freshness\", weight * 0.5, weight, \"post time unknown\");\n  let ageHours = (now.getTime() - posted.getTime()) / 3600000;\n  if (ageHours < 0) ageHours = 0;\n  const fresh = Number(cfg.fresh_hours === undefined ? 2 : cfg.fresh_hours);\n  const stale = Number(cfg.stale_hours === undefined ? 48 : cfg.stale_hours);\n  let share;\n  if (ageHours <= fresh) share = 1;\n  else if (stale <= fresh) share = 0;\n  else share = clamp((stale - ageHours) / (stale - fresh));\n  return crit(\n    \"freshness\",\n    weight * share,\n    weight,\n    \"posted \" + hours(ageHours) + \"h ago\",\n  );\n}\n\n// -- public -----------------------------------------------------------------\n\nfunction scoreJob(job, rubric, now) {\n  const rub = mergeRubric(DEFAULT_RUBRIC, rubric);\n  const when = now ? (now instanceof Date ? now : new Date(now)) : new Date();\n  const weights = rub.weights || {};\n  const disq = [];\n\n  const handlers = [\n    [\"client_country\", (w) => cCountry(job, rub, w, disq)],\n    [\"hire_rate\", (w) => cHireRate(job, rub, w, disq)],\n    [\"client_spend\", (w) => cSpend(job, rub, w, disq)],\n    [\"payment_verified\", (w) => cPayment(job, rub, w, disq)],\n    [\"budget\", (w) => cBudget(job, rub, w, disq)],\n    [\"proposals\", (w) => cProposals(job, rub, w, disq)],\n    [\"keywords\", (w) => cKeywords(job, rub, w, disq)],\n    [\"freshness\", (w) => cFreshness(job, rub, w, disq, when)],\n  ];\n\n  const breakdown = [];\n  let earned = 0;\n  let possible = 0;\n  handlers.forEach((pair) => {\n    const weight = Number(weights[pair[0]] || 0);\n    if (weight <= 0) return;\n    const result = pair[1](weight);\n    breakdown.push(result);\n    earned += result.earned;\n    possible += result.maximum;\n  });\n\n  const raw =\n    possible <= 0 ? 0 : Math.trunc(roundHalfUp((earned / possible) * 100, 0));\n  const score = disq.length ? 0 : raw;\n  const threshold = Number(\n    rub.alert_threshold === undefined ? 70 : rub.alert_threshold,\n  );\n\n  return {\n    id: job.id === undefined ? null : job.id,\n    title: job.title === undefined ? null : job.title,\n    url: job.url === undefined ? null : job.url,\n    score: score,\n    raw_score: raw,\n    threshold: threshold,\n    disqualified: disq.length > 0,\n    disqualifiers: disq,\n    passed: disq.length === 0 && score >= threshold,\n    breakdown: breakdown,\n  };\n}\n\nfunction scoreJobs(jobs, rubric, now) {\n  const results = (jobs || []).map((job) => scoreJob(job, rubric, now));\n  results.sort((a, b) => b.score - a.score);\n  return results;\n}\n\nif (typeof module !== \"undefined\" && module.exports) {\n  module.exports = { DEFAULT_RUBRIC, scoreJob, scoreJobs, roundHalfUp };\n}\n\n/**\n * JS twin of scoring/caps.py - the three loop caps plus the circuit breaker.\n *\n * Embedded into the \"Caps Preflight\" and \"Persist State\" Code nodes of\n * workflows/upwork-job-radar.json by scripts/build_workflow.py. Edit here,\n * then rebuild - never edit the copy inside the workflow JSON.\n *\n * In n8n the state object lives in $getWorkflowStaticData('global').caps, so\n * it survives between executions, which is the whole point of a spend counter.\n *\n * tests/test_parity.py drives the same scripted sequence through both this\n * file and caps.py and fails if the resulting state differs.\n */\n\nconst DEFAULT_CAPS = {\n  max_steps_per_run: 200,\n  wall_clock_seconds: 120,\n  spend: { cap_usd: 5.0, window_hours: 24 },\n  circuit_breaker: {\n    consecutive_errors: 3,\n    cooldown_minutes: 60,\n    auto_disable: true,\n  },\n};\n\nclass CapExceeded extends Error {\n  constructor(cap, message) {\n    super(message);\n    this.name = \"CapExceeded\";\n    this.cap = cap;\n  }\n}\n\nclass CircuitOpen extends CapExceeded {\n  constructor(message) {\n    super(\"circuit_breaker\", message);\n    this.name = \"CircuitOpen\";\n  }\n}\n\nfunction mergeCaps(base, override) {\n  const out = {};\n  Object.keys(base).forEach((k) => {\n    const v = base[k];\n    out[k] =\n      v && typeof v === \"object\" && !Array.isArray(v)\n        ? Object.assign({}, v)\n        : v;\n  });\n  if (!override) return out;\n  Object.keys(override).forEach((k) => {\n    const v = override[k];\n    if (\n      v &&\n      typeof v === \"object\" &&\n      !Array.isArray(v) &&\n      out[k] &&\n      typeof out[k] === \"object\" &&\n      !Array.isArray(out[k])\n    ) {\n      out[k] = Object.assign({}, out[k], v);\n    } else {\n      out[k] = v;\n    }\n  });\n  return out;\n}\n\nfunction parseDate(value) {\n  if (value === null || value === undefined) return null;\n  if (value instanceof Date) return isNaN(value.getTime()) ? null : value;\n  let text = String(value);\n  if (!/(Z|[+-]\\d{2}:?\\d{2})$/.test(text)) text += \"Z\";\n  const ms = Date.parse(text);\n  return isNaN(ms) ? null : new Date(ms);\n}\n\nfunction isoOf(date) {\n  return date === null || date === undefined ? null : date.toISOString();\n}\n\nclass CapsGuard {\n  constructor(caps, state, nowFn) {\n    this.caps = mergeCaps(DEFAULT_CAPS, caps);\n    this.nowFn = nowFn || (() => new Date());\n    const s = state || {};\n    this.spendUsd = Number(s.spend_usd || 0);\n    this.windowStart = parseDate(s.window_start) || this.nowFn();\n    this.consecutiveErrors = Number(s.consecutive_errors || 0);\n    this.disabled = Boolean(s.disabled);\n    this.disabledReason =\n      s.disabled_reason === undefined ? null : s.disabled_reason;\n    this.disabledAt = parseDate(s.disabled_at);\n    this.lastError = s.last_error === undefined ? null : s.last_error;\n    this.totalRuns = Number(s.total_runs || 0);\n    this.totalSteps = Number(s.total_steps || 0);\n    this.halfOpen = Boolean(s.half_open);\n    this.steps = 0;\n    this.runStarted = null;\n  }\n\n  toDict() {\n    return {\n      spend_usd: Math.round(this.spendUsd * 1e6) / 1e6,\n      window_start: isoOf(this.windowStart),\n      consecutive_errors: this.consecutiveErrors,\n      disabled: this.disabled,\n      disabled_reason: this.disabledReason,\n      disabled_at: isoOf(this.disabledAt),\n      last_error: this.lastError,\n      total_runs: this.totalRuns,\n      total_steps: this.totalSteps,\n      half_open: this.halfOpen,\n    };\n  }\n\n  rollSpendWindow() {\n    const windowHours = Number(\n      this.caps.spend.window_hours === undefined\n        ? 24\n        : this.caps.spend.window_hours,\n    );\n    if (\n      this.nowFn().getTime() - this.windowStart.getTime() >=\n      windowHours * 3600000\n    ) {\n      this.spendUsd = 0;\n      this.windowStart = this.nowFn();\n    }\n  }\n\n  cooldownElapsed() {\n    const minutes = Number(this.caps.circuit_breaker.cooldown_minutes || 0);\n    if (!this.disabledAt || minutes <= 0) return false;\n    return (\n      this.nowFn().getTime() - this.disabledAt.getTime() >= minutes * 60000\n    );\n  }\n\n  trip(reason) {\n    this.disabled = true;\n    this.disabledReason = reason;\n    this.disabledAt = this.nowFn();\n    this.halfOpen = false;\n  }\n\n  startRun() {\n    if (this.disabled) {\n      if (this.cooldownElapsed()) {\n        this.disabled = false;\n        this.halfOpen = true;\n      } else {\n        throw new CircuitOpen(\n          \"circuit breaker open: \" + String(this.disabledReason),\n        );\n      }\n    }\n    this.rollSpendWindow();\n    this.steps = 0;\n    this.runStarted = this.nowFn();\n    this.totalRuns += 1;\n  }\n\n  check(projectedCostUsd) {\n    const projected = Number(projectedCostUsd || 0);\n    if (this.disabled) {\n      throw new CircuitOpen(\n        \"circuit breaker open: \" + String(this.disabledReason),\n      );\n    }\n    const maxSteps = Number(this.caps.max_steps_per_run || 0);\n    if (maxSteps && this.steps >= maxSteps) {\n      throw new CapExceeded(\n        \"max_steps_per_run\",\n        \"step cap reached: \" + this.steps + \"/\" + maxSteps,\n      );\n    }\n    const wall = Number(this.caps.wall_clock_seconds || 0);\n    if (wall && this.runStarted) {\n      const elapsed =\n        (this.nowFn().getTime() - this.runStarted.getTime()) / 1000;\n      if (elapsed >= wall) {\n        throw new CapExceeded(\n          \"wall_clock_seconds\",\n          \"wall clock cap reached: \" +\n            elapsed.toFixed(1) +\n            \"s/\" +\n            wall.toFixed(0) +\n            \"s\",\n        );\n      }\n    }\n    const capUsd = Number(this.caps.spend.cap_usd || 0);\n    if (capUsd) {\n      this.rollSpendWindow();\n      if (this.spendUsd + projected > capUsd) {\n        throw new CapExceeded(\n          \"spend\",\n          \"spend cap reached: $\" +\n            (this.spendUsd + projected).toFixed(4) +\n            \"/$\" +\n            capUsd.toFixed(2) +\n            \" in the last \" +\n            this.caps.spend.window_hours +\n            \"h\",\n        );\n      }\n    }\n  }\n\n  recordStep(costUsd) {\n    this.steps += 1;\n    this.totalSteps += 1;\n    const cost = Number(costUsd || 0);\n    if (cost) {\n      this.rollSpendWindow();\n      this.spendUsd += cost;\n    }\n  }\n\n  recordError(message) {\n    this.consecutiveErrors += 1;\n    this.lastError = message || null;\n    const breaker = this.caps.circuit_breaker;\n    if (breaker.auto_disable === false) return false;\n    const limit = Number(breaker.consecutive_errors || 3);\n    if (this.halfOpen) {\n      this.trip(\"half-open probe failed: \" + (message || \"unknown error\"));\n      return true;\n    }\n    if (this.consecutiveErrors >= limit) {\n      this.trip(\n        this.consecutiveErrors +\n          \" consecutive errors (limit \" +\n          limit +\n          \"): \" +\n          (message || \"unknown error\"),\n      );\n      return true;\n    }\n    return false;\n  }\n\n  recordSuccess() {\n    this.consecutiveErrors = 0;\n    this.lastError = null;\n    this.halfOpen = false;\n  }\n\n  reset() {\n    this.disabled = false;\n    this.disabledReason = null;\n    this.disabledAt = null;\n    this.consecutiveErrors = 0;\n    this.halfOpen = false;\n  }\n\n  remaining() {\n    this.rollSpendWindow();\n    const elapsed = this.runStarted\n      ? (this.nowFn().getTime() - this.runStarted.getTime()) / 1000\n      : 0;\n    return {\n      steps_used: this.steps,\n      steps_cap: Number(this.caps.max_steps_per_run || 0),\n      seconds_used: Math.round(elapsed * 100) / 100,\n      seconds_cap: Number(this.caps.wall_clock_seconds || 0),\n      spend_used_usd: Math.round(this.spendUsd * 10000) / 10000,\n      spend_cap_usd: Number(this.caps.spend.cap_usd || 0),\n      spend_window_hours: this.caps.spend.window_hours,\n      consecutive_errors: this.consecutiveErrors,\n      disabled: this.disabled,\n      disabled_reason: this.disabledReason,\n      half_open: this.halfOpen,\n    };\n  }\n}\n\nif (typeof module !== \"undefined\" && module.exports) {\n  module.exports = { DEFAULT_CAPS, CapsGuard, CapExceeded, CircuitOpen };\n}\n\n// --- n8n runner ---\n// --- n8n runner: score every job, counting each one against the step cap ---\nconst staticData = $getWorkflowStaticData('global');\nconst items = $input.all();\nif (!items.length) return [];\n\nconst cfg = $('Caps Preflight').first().json;\nconst guard = new CapsGuard(cfg.caps, staticData.caps);\n// Re-anchor the wall clock to when this run actually started, not to now.\nguard.runStarted = new Date(staticData.run_started_at || Date.now());\n\nconst out = [];\nlet stoppedBy = null;\nfor (const item of items) {\n  try {\n    guard.check(0);\n  } catch (err) {\n    stoppedBy = err.cap + ': ' + err.message;\n    break;\n  }\n  const job = item.json.job;\n  const result = scoreJob(job, item.json.rubric, new Date());\n  guard.recordStep(0);\n  out.push({ json: { job, result, stopped_by: null } });\n}\n\nstaticData.caps = guard.toDict();\nif (stoppedBy && out.length) out[0].json.stopped_by = stoppedBy;\nif (stoppedBy && !out.length) return [{ json: { stopped_by: stoppedBy, result: null } }];\nreturn out;\n"
+      },
+      "id": "score-jobs",
+      "name": "Score Jobs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        860,
+        -110
+      ],
+      "notes": "Embedded copy of workflows/code-nodes/score.js + caps.js. Built by scripts/build_workflow.py - do not edit here.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "passed",
+              "leftValue": "={{ $json.result.passed }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "passed-threshold",
+      "name": "Passed Threshold?",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        -110
+      ],
+      "notes": "Only jobs at or above the configured alert threshold continue. Everything else is dropped silently."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Skip Already Alerted - one alert per job id, ever. Keeps the last 2000 ids\n// in workflow static data so a restart does not re-spam the channel.\nconst staticData = $getWorkflowStaticData('global');\nstaticData.seen = Array.isArray(staticData.seen) ? staticData.seen : [];\nconst seen = new Set(staticData.seen);\n\nconst fresh = [];\nfor (const item of $input.all()) {\n  const id = item.json.result && item.json.result.id;\n  if (!id || seen.has(id)) continue;\n  seen.add(id);\n  fresh.push(item);\n}\n\nstaticData.seen = Array.from(seen).slice(-2000);\nreturn fresh;\n"
+      },
+      "id": "skip-already-alerted",
+      "name": "Skip Already Alerted",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        -110
+      ],
+      "notes": "One alert per job id, ever. Static data survives restarts.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Format Slack Alert - mirrors scoring/slack.py build_slack_blocks().\n// The draft opener is a template, not a model call, so a default install\n// spends nothing. Swap in an LLM node here if you want richer drafts - that\n// is exactly what the spend cap in Caps Preflight is protecting.\nconst BAR = 10;\nconst bar = (earned, maximum) => {\n  if (maximum <= 0) return ' '.repeat(BAR);\n  const filled = Math.round(BAR * Math.max(0, Math.min(1, earned / maximum)));\n  return '#'.repeat(filled) + '.'.repeat(BAR - filled);\n};\nconst money = (v) => (v === null || v === undefined || isNaN(Number(v))\n  ? 'n/a'\n  : '$' + String(Math.round(Number(v))).replace(/\\B(?=(\\d{3})+(?!\\d))/g, ','));\nconst budgetLine = (job) => {\n  if (String(job.job_type || 'fixed').toLowerCase() === 'hourly') {\n    if (job.hourly_min && job.hourly_max) {\n      return money(job.hourly_min) + '-' + money(job.hourly_max) + '/hr';\n    }\n    if (job.hourly_max || job.hourly_min) return money(job.hourly_max || job.hourly_min) + '/hr';\n    return 'hourly, rate not stated';\n  }\n  return job.budget ? money(job.budget) + ' fixed' : 'budget not stated';\n};\nconst draftOpener = (job, result) => {\n  const skills = (job.skills || []).slice(0, 3).map(String);\n  const skillsTxt = skills.length ? skills.join(', ') : 'the stack you listed';\n  const ranked = (result.breakdown || []).filter((b) => b.maximum > 0)\n    .sort((a, b) => (b.earned / b.maximum) - (a.earned / a.maximum));\n  const angle = ranked.length ? ranked[0].reason : 'the brief';\n  return 'Hi - on \"' + String(job.title || 'your project').trim() + '\": the part I would '\n    + 'start with is ' + skillsTxt + ', because that is where this scope usually stalls.\\n'\n    + 'Two questions before I quote: what does done look like for you, and who owns the '\n    + 'accounts/credentials?\\nSignal I picked up from the post: ' + angle + '.';\n};\n\nreturn $input.all().map((item) => {\n  const job = item.json.job;\n  const result = item.json.result;\n  const client = job.client || {};\n  const lines = (result.breakdown || []).map((b) => '`' + b.key + '` '\n    + bar(b.earned, b.maximum) + ' ' + b.earned + '/' + Math.round(b.maximum)\n    + ' - ' + b.reason);\n  const blocks = [\n    { type: 'header',\n      text: { type: 'plain_text', text: 'Score ' + result.score + ' - ' + String(job.title || '').slice(0, 120) } },\n    { type: 'section',\n      fields: [\n        { type: 'mrkdwn', text: '*Budget*\\n' + budgetLine(job) },\n        { type: 'mrkdwn', text: '*Country*\\n' + (client.country || 'unknown') },\n        { type: 'mrkdwn', text: '*Proposals*\\n' + (job.proposals === null || job.proposals === undefined ? 'unknown' : job.proposals) },\n        { type: 'mrkdwn', text: '*Client spend*\\n' + money(client.total_spend) },\n      ] },\n    { type: 'section', text: { type: 'mrkdwn', text: '*Why it scored this*\\n' + lines.join('\\n') } },\n    { type: 'section', text: { type: 'mrkdwn', text: '*Draft opener (yours to edit - nothing was sent)*\\n>' + draftOpener(job, result).replace(/\\n/g, '\\n>') } },\n    { type: 'context', elements: [{ type: 'mrkdwn',\n      text: 'Read-only alert. Nothing was submitted to Upwork. <' + (job.url || 'https://www.upwork.com') + '|Open the job> and apply by hand.' }] },\n  ];\n  return { json: { text: 'Upwork Job Radar: ' + String(job.title || '').slice(0, 80) + ' scored ' + result.score, blocks } };\n});\n"
+      },
+      "id": "format-slack-alert",
+      "name": "Format Slack Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1520,
+        -110
+      ],
+      "notes": "Renders the score breakdown + a DRAFT opener. Nothing is sent to Upwork here or anywhere else.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "={{ $env.SLACK_CHANNEL_ID }}",
+          "mode": "id"
+        },
+        "messageType": "block",
+        "blocksUi": "={{ JSON.stringify($json.blocks) }}",
+        "text": "={{ $json.text }}",
+        "otherOptions": {
+          "includeLinkToWorkflow": false
+        }
+      },
+      "id": "post-alert-to-slack",
+      "name": "Post Alert to Slack",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [
+        1740,
+        -110
+      ],
+      "notes": "The only outbound side effect in the whole workflow: a Slack message to a human.",
+      "credentials": {
+        "slackApi": {
+          "id": "REPLACE_ME",
+          "name": "Slack account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "/**\n * JS twin of scoring/caps.py - the three loop caps plus the circuit breaker.\n *\n * Embedded into the \"Caps Preflight\" and \"Persist State\" Code nodes of\n * workflows/upwork-job-radar.json by scripts/build_workflow.py. Edit here,\n * then rebuild - never edit the copy inside the workflow JSON.\n *\n * In n8n the state object lives in $getWorkflowStaticData('global').caps, so\n * it survives between executions, which is the whole point of a spend counter.\n *\n * tests/test_parity.py drives the same scripted sequence through both this\n * file and caps.py and fails if the resulting state differs.\n */\n\nconst DEFAULT_CAPS = {\n  max_steps_per_run: 200,\n  wall_clock_seconds: 120,\n  spend: { cap_usd: 5.0, window_hours: 24 },\n  circuit_breaker: {\n    consecutive_errors: 3,\n    cooldown_minutes: 60,\n    auto_disable: true,\n  },\n};\n\nclass CapExceeded extends Error {\n  constructor(cap, message) {\n    super(message);\n    this.name = \"CapExceeded\";\n    this.cap = cap;\n  }\n}\n\nclass CircuitOpen extends CapExceeded {\n  constructor(message) {\n    super(\"circuit_breaker\", message);\n    this.name = \"CircuitOpen\";\n  }\n}\n\nfunction mergeCaps(base, override) {\n  const out = {};\n  Object.keys(base).forEach((k) => {\n    const v = base[k];\n    out[k] =\n      v && typeof v === \"object\" && !Array.isArray(v)\n        ? Object.assign({}, v)\n        : v;\n  });\n  if (!override) return out;\n  Object.keys(override).forEach((k) => {\n    const v = override[k];\n    if (\n      v &&\n      typeof v === \"object\" &&\n      !Array.isArray(v) &&\n      out[k] &&\n      typeof out[k] === \"object\" &&\n      !Array.isArray(out[k])\n    ) {\n      out[k] = Object.assign({}, out[k], v);\n    } else {\n      out[k] = v;\n    }\n  });\n  return out;\n}\n\nfunction parseDate(value) {\n  if (value === null || value === undefined) return null;\n  if (value instanceof Date) return isNaN(value.getTime()) ? null : value;\n  let text = String(value);\n  if (!/(Z|[+-]\\d{2}:?\\d{2})$/.test(text)) text += \"Z\";\n  const ms = Date.parse(text);\n  return isNaN(ms) ? null : new Date(ms);\n}\n\nfunction isoOf(date) {\n  return date === null || date === undefined ? null : date.toISOString();\n}\n\nclass CapsGuard {\n  constructor(caps, state, nowFn) {\n    this.caps = mergeCaps(DEFAULT_CAPS, caps);\n    this.nowFn = nowFn || (() => new Date());\n    const s = state || {};\n    this.spendUsd = Number(s.spend_usd || 0);\n    this.windowStart = parseDate(s.window_start) || this.nowFn();\n    this.consecutiveErrors = Number(s.consecutive_errors || 0);\n    this.disabled = Boolean(s.disabled);\n    this.disabledReason =\n      s.disabled_reason === undefined ? null : s.disabled_reason;\n    this.disabledAt = parseDate(s.disabled_at);\n    this.lastError = s.last_error === undefined ? null : s.last_error;\n    this.totalRuns = Number(s.total_runs || 0);\n    this.totalSteps = Number(s.total_steps || 0);\n    this.halfOpen = Boolean(s.half_open);\n    this.steps = 0;\n    this.runStarted = null;\n  }\n\n  toDict() {\n    return {\n      spend_usd: Math.round(this.spendUsd * 1e6) / 1e6,\n      window_start: isoOf(this.windowStart),\n      consecutive_errors: this.consecutiveErrors,\n      disabled: this.disabled,\n      disabled_reason: this.disabledReason,\n      disabled_at: isoOf(this.disabledAt),\n      last_error: this.lastError,\n      total_runs: this.totalRuns,\n      total_steps: this.totalSteps,\n      half_open: this.halfOpen,\n    };\n  }\n\n  rollSpendWindow() {\n    const windowHours = Number(\n      this.caps.spend.window_hours === undefined\n        ? 24\n        : this.caps.spend.window_hours,\n    );\n    if (\n      this.nowFn().getTime() - this.windowStart.getTime() >=\n      windowHours * 3600000\n    ) {\n      this.spendUsd = 0;\n      this.windowStart = this.nowFn();\n    }\n  }\n\n  cooldownElapsed() {\n    const minutes = Number(this.caps.circuit_breaker.cooldown_minutes || 0);\n    if (!this.disabledAt || minutes <= 0) return false;\n    return (\n      this.nowFn().getTime() - this.disabledAt.getTime() >= minutes * 60000\n    );\n  }\n\n  trip(reason) {\n    this.disabled = true;\n    this.disabledReason = reason;\n    this.disabledAt = this.nowFn();\n    this.halfOpen = false;\n  }\n\n  startRun() {\n    if (this.disabled) {\n      if (this.cooldownElapsed()) {\n        this.disabled = false;\n        this.halfOpen = true;\n      } else {\n        throw new CircuitOpen(\n          \"circuit breaker open: \" + String(this.disabledReason),\n        );\n      }\n    }\n    this.rollSpendWindow();\n    this.steps = 0;\n    this.runStarted = this.nowFn();\n    this.totalRuns += 1;\n  }\n\n  check(projectedCostUsd) {\n    const projected = Number(projectedCostUsd || 0);\n    if (this.disabled) {\n      throw new CircuitOpen(\n        \"circuit breaker open: \" + String(this.disabledReason),\n      );\n    }\n    const maxSteps = Number(this.caps.max_steps_per_run || 0);\n    if (maxSteps && this.steps >= maxSteps) {\n      throw new CapExceeded(\n        \"max_steps_per_run\",\n        \"step cap reached: \" + this.steps + \"/\" + maxSteps,\n      );\n    }\n    const wall = Number(this.caps.wall_clock_seconds || 0);\n    if (wall && this.runStarted) {\n      const elapsed =\n        (this.nowFn().getTime() - this.runStarted.getTime()) / 1000;\n      if (elapsed >= wall) {\n        throw new CapExceeded(\n          \"wall_clock_seconds\",\n          \"wall clock cap reached: \" +\n            elapsed.toFixed(1) +\n            \"s/\" +\n            wall.toFixed(0) +\n            \"s\",\n        );\n      }\n    }\n    const capUsd = Number(this.caps.spend.cap_usd || 0);\n    if (capUsd) {\n      this.rollSpendWindow();\n      if (this.spendUsd + projected > capUsd) {\n        throw new CapExceeded(\n          \"spend\",\n          \"spend cap reached: $\" +\n            (this.spendUsd + projected).toFixed(4) +\n            \"/$\" +\n            capUsd.toFixed(2) +\n            \" in the last \" +\n            this.caps.spend.window_hours +\n            \"h\",\n        );\n      }\n    }\n  }\n\n  recordStep(costUsd) {\n    this.steps += 1;\n    this.totalSteps += 1;\n    const cost = Number(costUsd || 0);\n    if (cost) {\n      this.rollSpendWindow();\n      this.spendUsd += cost;\n    }\n  }\n\n  recordError(message) {\n    this.consecutiveErrors += 1;\n    this.lastError = message || null;\n    const breaker = this.caps.circuit_breaker;\n    if (breaker.auto_disable === false) return false;\n    const limit = Number(breaker.consecutive_errors || 3);\n    if (this.halfOpen) {\n      this.trip(\"half-open probe failed: \" + (message || \"unknown error\"));\n      return true;\n    }\n    if (this.consecutiveErrors >= limit) {\n      this.trip(\n        this.consecutiveErrors +\n          \" consecutive errors (limit \" +\n          limit +\n          \"): \" +\n          (message || \"unknown error\"),\n      );\n      return true;\n    }\n    return false;\n  }\n\n  recordSuccess() {\n    this.consecutiveErrors = 0;\n    this.lastError = null;\n    this.halfOpen = false;\n  }\n\n  reset() {\n    this.disabled = false;\n    this.disabledReason = null;\n    this.disabledAt = null;\n    this.consecutiveErrors = 0;\n    this.halfOpen = false;\n  }\n\n  remaining() {\n    this.rollSpendWindow();\n    const elapsed = this.runStarted\n      ? (this.nowFn().getTime() - this.runStarted.getTime()) / 1000\n      : 0;\n    return {\n      steps_used: this.steps,\n      steps_cap: Number(this.caps.max_steps_per_run || 0),\n      seconds_used: Math.round(elapsed * 100) / 100,\n      seconds_cap: Number(this.caps.wall_clock_seconds || 0),\n      spend_used_usd: Math.round(this.spendUsd * 10000) / 10000,\n      spend_cap_usd: Number(this.caps.spend.cap_usd || 0),\n      spend_window_hours: this.caps.spend.window_hours,\n      consecutive_errors: this.consecutiveErrors,\n      disabled: this.disabled,\n      disabled_reason: this.disabledReason,\n      half_open: this.halfOpen,\n    };\n  }\n}\n\nif (typeof module !== \"undefined\" && module.exports) {\n  module.exports = { DEFAULT_CAPS, CapsGuard, CapExceeded, CircuitOpen };\n}\n\n// --- n8n runner ---\n// Persist State - close the run out cleanly: clear the error streak, roll the\n// spend counter forward, and keep a small history for the daily digest.\nconst staticData = $getWorkflowStaticData('global');\nconst cfg = $('Caps Preflight').first().json;\nconst guard = new CapsGuard(cfg.caps, staticData.caps);\nguard.recordSuccess();\nstaticData.caps = guard.toDict();\n\nstaticData.history = Array.isArray(staticData.history) ? staticData.history : [];\nfor (const item of $input.all()) {\n  staticData.history.push({\n    at: new Date().toISOString(),\n    id: item.json.result ? item.json.result.id : null,\n    score: item.json.result ? item.json.result.score : null,\n    title: item.json.result ? item.json.result.title : null,\n    passed: item.json.result ? item.json.result.passed : null,\n    disqualifiers: item.json.result ? item.json.result.disqualifiers : [],\n  });\n}\nstaticData.history = staticData.history.slice(-500);\n\nreturn [{ json: { alerted: $input.all().length, caps: guard.remaining() } }];\n"
+      },
+      "id": "persist-state",
+      "name": "Persist State",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1960,
+        -110
+      ],
+      "notes": "Clears the error streak, rolls the spend window, keeps 500 rows of history for the digest.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "/**\n * JS twin of scoring/caps.py - the three loop caps plus the circuit breaker.\n *\n * Embedded into the \"Caps Preflight\" and \"Persist State\" Code nodes of\n * workflows/upwork-job-radar.json by scripts/build_workflow.py. Edit here,\n * then rebuild - never edit the copy inside the workflow JSON.\n *\n * In n8n the state object lives in $getWorkflowStaticData('global').caps, so\n * it survives between executions, which is the whole point of a spend counter.\n *\n * tests/test_parity.py drives the same scripted sequence through both this\n * file and caps.py and fails if the resulting state differs.\n */\n\nconst DEFAULT_CAPS = {\n  max_steps_per_run: 200,\n  wall_clock_seconds: 120,\n  spend: { cap_usd: 5.0, window_hours: 24 },\n  circuit_breaker: {\n    consecutive_errors: 3,\n    cooldown_minutes: 60,\n    auto_disable: true,\n  },\n};\n\nclass CapExceeded extends Error {\n  constructor(cap, message) {\n    super(message);\n    this.name = \"CapExceeded\";\n    this.cap = cap;\n  }\n}\n\nclass CircuitOpen extends CapExceeded {\n  constructor(message) {\n    super(\"circuit_breaker\", message);\n    this.name = \"CircuitOpen\";\n  }\n}\n\nfunction mergeCaps(base, override) {\n  const out = {};\n  Object.keys(base).forEach((k) => {\n    const v = base[k];\n    out[k] =\n      v && typeof v === \"object\" && !Array.isArray(v)\n        ? Object.assign({}, v)\n        : v;\n  });\n  if (!override) return out;\n  Object.keys(override).forEach((k) => {\n    const v = override[k];\n    if (\n      v &&\n      typeof v === \"object\" &&\n      !Array.isArray(v) &&\n      out[k] &&\n      typeof out[k] === \"object\" &&\n      !Array.isArray(out[k])\n    ) {\n      out[k] = Object.assign({}, out[k], v);\n    } else {\n      out[k] = v;\n    }\n  });\n  return out;\n}\n\nfunction parseDate(value) {\n  if (value === null || value === undefined) return null;\n  if (value instanceof Date) return isNaN(value.getTime()) ? null : value;\n  let text = String(value);\n  if (!/(Z|[+-]\\d{2}:?\\d{2})$/.test(text)) text += \"Z\";\n  const ms = Date.parse(text);\n  return isNaN(ms) ? null : new Date(ms);\n}\n\nfunction isoOf(date) {\n  return date === null || date === undefined ? null : date.toISOString();\n}\n\nclass CapsGuard {\n  constructor(caps, state, nowFn) {\n    this.caps = mergeCaps(DEFAULT_CAPS, caps);\n    this.nowFn = nowFn || (() => new Date());\n    const s = state || {};\n    this.spendUsd = Number(s.spend_usd || 0);\n    this.windowStart = parseDate(s.window_start) || this.nowFn();\n    this.consecutiveErrors = Number(s.consecutive_errors || 0);\n    this.disabled = Boolean(s.disabled);\n    this.disabledReason =\n      s.disabled_reason === undefined ? null : s.disabled_reason;\n    this.disabledAt = parseDate(s.disabled_at);\n    this.lastError = s.last_error === undefined ? null : s.last_error;\n    this.totalRuns = Number(s.total_runs || 0);\n    this.totalSteps = Number(s.total_steps || 0);\n    this.halfOpen = Boolean(s.half_open);\n    this.steps = 0;\n    this.runStarted = null;\n  }\n\n  toDict() {\n    return {\n      spend_usd: Math.round(this.spendUsd * 1e6) / 1e6,\n      window_start: isoOf(this.windowStart),\n      consecutive_errors: this.consecutiveErrors,\n      disabled: this.disabled,\n      disabled_reason: this.disabledReason,\n      disabled_at: isoOf(this.disabledAt),\n      last_error: this.lastError,\n      total_runs: this.totalRuns,\n      total_steps: this.totalSteps,\n      half_open: this.halfOpen,\n    };\n  }\n\n  rollSpendWindow() {\n    const windowHours = Number(\n      this.caps.spend.window_hours === undefined\n        ? 24\n        : this.caps.spend.window_hours,\n    );\n    if (\n      this.nowFn().getTime() - this.windowStart.getTime() >=\n      windowHours * 3600000\n    ) {\n      this.spendUsd = 0;\n      this.windowStart = this.nowFn();\n    }\n  }\n\n  cooldownElapsed() {\n    const minutes = Number(this.caps.circuit_breaker.cooldown_minutes || 0);\n    if (!this.disabledAt || minutes <= 0) return false;\n    return (\n      this.nowFn().getTime() - this.disabledAt.getTime() >= minutes * 60000\n    );\n  }\n\n  trip(reason) {\n    this.disabled = true;\n    this.disabledReason = reason;\n    this.disabledAt = this.nowFn();\n    this.halfOpen = false;\n  }\n\n  startRun() {\n    if (this.disabled) {\n      if (this.cooldownElapsed()) {\n        this.disabled = false;\n        this.halfOpen = true;\n      } else {\n        throw new CircuitOpen(\n          \"circuit breaker open: \" + String(this.disabledReason),\n        );\n      }\n    }\n    this.rollSpendWindow();\n    this.steps = 0;\n    this.runStarted = this.nowFn();\n    this.totalRuns += 1;\n  }\n\n  check(projectedCostUsd) {\n    const projected = Number(projectedCostUsd || 0);\n    if (this.disabled) {\n      throw new CircuitOpen(\n        \"circuit breaker open: \" + String(this.disabledReason),\n      );\n    }\n    const maxSteps = Number(this.caps.max_steps_per_run || 0);\n    if (maxSteps && this.steps >= maxSteps) {\n      throw new CapExceeded(\n        \"max_steps_per_run\",\n        \"step cap reached: \" + this.steps + \"/\" + maxSteps,\n      );\n    }\n    const wall = Number(this.caps.wall_clock_seconds || 0);\n    if (wall && this.runStarted) {\n      const elapsed =\n        (this.nowFn().getTime() - this.runStarted.getTime()) / 1000;\n      if (elapsed >= wall) {\n        throw new CapExceeded(\n          \"wall_clock_seconds\",\n          \"wall clock cap reached: \" +\n            elapsed.toFixed(1) +\n            \"s/\" +\n            wall.toFixed(0) +\n            \"s\",\n        );\n      }\n    }\n    const capUsd = Number(this.caps.spend.cap_usd || 0);\n    if (capUsd) {\n      this.rollSpendWindow();\n      if (this.spendUsd + projected > capUsd) {\n        throw new CapExceeded(\n          \"spend\",\n          \"spend cap reached: $\" +\n            (this.spendUsd + projected).toFixed(4) +\n            \"/$\" +\n            capUsd.toFixed(2) +\n            \" in the last \" +\n            this.caps.spend.window_hours +\n            \"h\",\n        );\n      }\n    }\n  }\n\n  recordStep(costUsd) {\n    this.steps += 1;\n    this.totalSteps += 1;\n    const cost = Number(costUsd || 0);\n    if (cost) {\n      this.rollSpendWindow();\n      this.spendUsd += cost;\n    }\n  }\n\n  recordError(message) {\n    this.consecutiveErrors += 1;\n    this.lastError = message || null;\n    const breaker = this.caps.circuit_breaker;\n    if (breaker.auto_disable === false) return false;\n    const limit = Number(breaker.consecutive_errors || 3);\n    if (this.halfOpen) {\n      this.trip(\"half-open probe failed: \" + (message || \"unknown error\"));\n      return true;\n    }\n    if (this.consecutiveErrors >= limit) {\n      this.trip(\n        this.consecutiveErrors +\n          \" consecutive errors (limit \" +\n          limit +\n          \"): \" +\n          (message || \"unknown error\"),\n      );\n      return true;\n    }\n    return false;\n  }\n\n  recordSuccess() {\n    this.consecutiveErrors = 0;\n    this.lastError = null;\n    this.halfOpen = false;\n  }\n\n  reset() {\n    this.disabled = false;\n    this.disabledReason = null;\n    this.disabledAt = null;\n    this.consecutiveErrors = 0;\n    this.halfOpen = false;\n  }\n\n  remaining() {\n    this.rollSpendWindow();\n    const elapsed = this.runStarted\n      ? (this.nowFn().getTime() - this.runStarted.getTime()) / 1000\n      : 0;\n    return {\n      steps_used: this.steps,\n      steps_cap: Number(this.caps.max_steps_per_run || 0),\n      seconds_used: Math.round(elapsed * 100) / 100,\n      seconds_cap: Number(this.caps.wall_clock_seconds || 0),\n      spend_used_usd: Math.round(this.spendUsd * 10000) / 10000,\n      spend_cap_usd: Number(this.caps.spend.cap_usd || 0),\n      spend_window_hours: this.caps.spend.window_hours,\n      consecutive_errors: this.consecutiveErrors,\n      disabled: this.disabled,\n      disabled_reason: this.disabledReason,\n      half_open: this.halfOpen,\n    };\n  }\n}\n\nif (typeof module !== \"undefined\" && module.exports) {\n  module.exports = { DEFAULT_CAPS, CapsGuard, CapExceeded, CircuitOpen };\n}\n\n// --- n8n runner ---\n// --- n8n runner: breaker alert --------------------------------------------\n// Reached from two places, and they mean opposite things:\n//\n//   a) Caps Preflight said blocked=true. The guard already refused this run;\n//      counting it again would let a tripped breaker inflate its own counter.\n//   b) The Upwork call errored (onError: continueErrorOutput). THAT is a real\n//      failure and it is the only thing that advances the error streak.\n//\n// Without this node calling recordError(), the breaker could never trip in\n// production no matter how many times the API fell over.\nconst staticData = $getWorkflowStaticData('global');\nconst cfg = $input.first().json;\nconst preflight = $('Caps Preflight').first().json;\nconst wasRefusedByCaps = cfg.blocked === true;\n\nlet state = cfg.caps_state || preflight.caps_state || {};\nlet cap = cfg.blocked_cap || null;\nlet reason = cfg.blocked_reason || null;\n\nif (!wasRefusedByCaps) {\n  const guard = new CapsGuard(preflight.caps, staticData.caps);\n  const message = (cfg.error && (cfg.error.message || cfg.error))\n    || 'Upwork API request failed';\n  const tripped = guard.recordError(String(message));\n  staticData.caps = guard.toDict();\n  state = guard.toDict();\n  cap = tripped ? 'circuit_breaker' : 'upstream_error';\n  reason = tripped\n    ? guard.disabledReason\n    : String(message) + ' (' + guard.consecutiveErrors + ' consecutive)';\n}\n\nreturn [{\n  json: {\n    text: 'Upwork Job Radar halted: ' + (reason || 'unknown reason'),\n    blocks: [\n      { type: 'header', text: { type: 'plain_text', text: 'Job Radar halted - ' + (cap || 'cap') } },\n      { type: 'section', text: { type: 'mrkdwn', text: '*Reason*\\n' + (reason || 'unknown') } },\n      { type: 'section', fields: [\n        { type: 'mrkdwn', text: '*Consecutive errors*\\n' + (state.consecutive_errors || 0) },\n        { type: 'mrkdwn', text: '*Spend this window*\\n$' + Number(state.spend_usd || 0).toFixed(4) },\n        { type: 'mrkdwn', text: '*Breaker*\\n' + (state.disabled ? 'OPEN - workflow disabled' : 'closed') },\n      ] },\n      { type: 'context', elements: [{ type: 'mrkdwn',\n        text: state.disabled\n          ? 'The workflow disabled itself. It allows one probe run after the cooldown; fix the cause, or reset it by clearing `caps` in workflow static data.'\n          : 'Counted against the error streak. The breaker opens once the streak reaches the configured limit.' }] },\n    ],\n  },\n}];\n"
+      },
+      "id": "build-breaker-alert",
+      "name": "Build Breaker Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        140
+      ],
+      "notes": "Explains which cap stopped the run. Also the ONLY node that calls recordError() - without it the breaker could never trip.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "={{ $env.SLACK_CHANNEL_ID }}",
+          "mode": "id"
+        },
+        "messageType": "block",
+        "blocksUi": "={{ JSON.stringify($json.blocks) }}",
+        "text": "={{ $json.text }}",
+        "otherOptions": {
+          "includeLinkToWorkflow": false
+        }
+      },
+      "id": "post-breaker-alert",
+      "name": "Post Breaker Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [
+        640,
+        140
+      ],
+      "notes": "Fires when the breaker is open or a cap was hit.",
+      "credentials": {
+        "slackApi": {
+          "id": "REPLACE_ME",
+          "name": "Slack account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 8 * * *"
+            }
+          ]
+        }
+      },
+      "id": "schedule-digest",
+      "name": "Daily 08:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -460,
+        320
+      ],
+      "notes": "Daily digest trigger. Server timezone."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Build Digest - a once-a-day summary from the history the runs persisted.\n// Mirrors scoring/slack.py render_digest().\nconst staticData = $getWorkflowStaticData('global');\nconst history = Array.isArray(staticData.history) ? staticData.history : [];\nconst since = Date.now() - 24 * 3600 * 1000;\nconst window = history.filter((h) => Date.parse(h.at) >= since);\nconst passed = window.filter((h) => h.passed);\nconst disq = window.filter((h) => (h.disqualifiers || []).length);\n\nconst counts = {};\ndisq.forEach((h) => (h.disqualifiers || []).forEach((d) => {\n  const key = String(d).split(':')[0];\n  counts[key] = (counts[key] || 0) + 1;\n}));\nconst topReasons = Object.keys(counts).sort((a, b) => counts[b] - counts[a]).slice(0, 5);\n\nconst caps = staticData.caps || {};\nconst lines = [\n  '*' + window.length + '* scored | *' + passed.length + '* passed | *' + disq.length + '* disqualified',\n  passed.length\n    ? passed.slice(0, 10).map((h) => '`' + h.score + '`  ' + String(h.title || '').slice(0, 56)).join('\\n')\n    : '_Nothing passed today. That is a normal day, not a broken radar._',\n];\nif (topReasons.length) {\n  lines.push('*Top disqualifier reasons*\\n'\n    + topReasons.map((r) => '`' + counts[r] + 'x`  ' + r).join('\\n'));\n}\nlines.push('_caps: $' + Number(caps.spend_usd || 0).toFixed(4) + ' spent this window | breaker '\n  + (caps.disabled ? 'OPEN (disabled)' : 'closed') + '_');\n\nreturn [{\n  json: {\n    text: 'Upwork Job Radar daily digest',\n    blocks: [\n      { type: 'header', text: { type: 'plain_text', text: 'Job Radar - last 24h' } },\n      { type: 'section', text: { type: 'mrkdwn', text: lines.join('\\n\\n') } },\n      { type: 'context', elements: [{ type: 'mrkdwn',\n        text: 'Read-only. No proposal was submitted and no Connect was spent.' }] },\n    ],\n  },\n}];\n"
+      },
+      "id": "build-digest",
+      "name": "Build Digest",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -240,
+        320
+      ],
+      "notes": "Summarises the last 24h from persisted history, including caps headroom.",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "={{ $env.SLACK_CHANNEL_ID }}",
+          "mode": "id"
+        },
+        "messageType": "block",
+        "blocksUi": "={{ JSON.stringify($json.blocks) }}",
+        "text": "={{ $json.text }}",
+        "otherOptions": {
+          "includeLinkToWorkflow": false
+        }
+      },
+      "id": "post-digest-to-slack",
+      "name": "Post Digest to Slack",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [
+        -20,
+        320
+      ],
+      "notes": "One digest a day, whether or not anything passed.",
+      "credentials": {
+        "slackApi": {
+          "id": "REPLACE_ME",
+          "name": "Slack account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Every 10 Minutes": {
+      "main": [
+        [
+          {
+            "node": "Load Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Config": {
+      "main": [
+        [
+          {
+            "node": "Caps Preflight",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Caps Preflight": {
+      "main": [
+        [
+          {
+            "node": "Caps OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Caps OK?": {
+      "main": [
+        [
+          {
+            "node": "Upwork GraphQL Search",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Breaker Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upwork GraphQL Search": {
+      "main": [
+        [
+          {
+            "node": "Normalize Jobs",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Breaker Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Jobs": {
+      "main": [
+        [
+          {
+            "node": "Score Jobs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Score Jobs": {
+      "main": [
+        [
+          {
+            "node": "Passed Threshold?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Passed Threshold?": {
+      "main": [
+        [
+          {
+            "node": "Skip Already Alerted",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Skip Already Alerted": {
+      "main": [
+        [
+          {
+            "node": "Format Slack Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Slack Alert": {
+      "main": [
+        [
+          {
+            "node": "Post Alert to Slack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Post Alert to Slack": {
+      "main": [
+        [
+          {
+            "node": "Persist State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Breaker Alert": {
+      "main": [
+        [
+          {
+            "node": "Post Breaker Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Daily 08:00": {
+      "main": [
+        [
+          {
+            "node": "Build Digest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Digest": {
+      "main": [
+        [
+          {
+            "node": "Post Digest to Slack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": true,
+    "executionTimeout": 300,
+    "timezone": "UTC"
+  },
+  "pinData": {},
+  "tags": [],
+  "meta": {
+    "description": "Read-only Upwork job radar. Polls the official API, scores each job against a configurable rubric, alerts a human in Slack. Never submits a proposal, never sends a message, never spends a Connect."
+  }
+}
