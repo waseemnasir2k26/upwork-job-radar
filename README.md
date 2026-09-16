@@ -2,6 +2,10 @@
 
 Polls the official Upwork API on a schedule, scores every new job against a rubric you control, and posts only the ones worth your time into Slack — with the full reasoning attached. It never applies to anything.
 
+## Status
+
+Last reviewed: September 2026 · release v2026.09
+
 ```
 UPWORK JOB RADAR  |  score 89/100  (alert at 70+)
 --------------------------------------------------------------
