@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented in this file.
 
+## [2026.10] - 2026-10-12
+
+- Public MIT read-only Upwork job scorer: polls the official Upwork API, scores jobs against an editable rubric, caps and circuit breaker, and alerts a human in Slack with per-criterion reasoning; it never applies or bids. Pure-stdlib Python 3.9+, mirrored JavaScript Code nodes and an importable n8n workflow.
+- October 2026 review: README, tree and history re-read (no commits since the 2026-09-16 release commit). 3 of 4 external README links returned HTTP 200; the fourth is the placeholder clone URL `github.com/YOUR-USERNAME/upwork-job-radar.git` (HTTP 404), left unchanged. No scoring, rubric, caps or workflow code was touched.
+- The old one-line "Built by SkynetLabs" footer was replaced with the Work with SkynetLabs section (Fiverr, Upwork, Calendly).
+- Known gaps: no CI workflow to run the existing tests, `pyproject.toml` still has version 1.0.0 and a `[project.urls] Homepage` pointing at `github.com/skynetlabs/upwork-job-radar` instead of this repo (not touched, as it is a code-adjacent file), and tests were not re-run this month.
+
 ## [2026.09] - 2026-09-16
 
 - Maintenance review of `upwork-job-radar` — a read-only Upwork job scorer: it polls the official Upwork API on a schedule, scores each new job against a rubric you control, and alerts a human in Slack with the full per-criterion reasoning. It never applies and never bids.
